@@ -1,0 +1,694 @@
+---
+title: "Combining WFP Price Data with Refugee Dataset"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+library(dplyr)
+library(data.table)
+library(zoo)
+library(quantmod)
+library(countrycode)
+library(IMFData)
+library(imputeTS)
+library(readxl)
+library(lubridate)
+library(tidyr)
+library(ggplot2)
+library(forcats)
+memory.limit(20000000000)
+
+dropbox_dir <- getwd()
+
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = dropbox_dir)
+
+# Download updated version of price data from: https://data.humdata.org/dataset/wfp-food-prices
+price_data <- fread("http://data.humdata.org/dataset/4fdcd4dc-5c2f-43af-a1e4-93c9b6539a27/resource/12d7c8e3-eff9-4db0-93b7-726825c4fe9a/download/wfpvam_foodprices.csv", encoding = "UTF-8")
+
+
+price_data <- price_data %>% filter(pt_name == "Retail") %>% select(-adm0_id, -adm1_id, -mkt_id, -cm_id, -cur_id, -pt_id, -mp_commoditysource)
+
+price_data$adm0_name[price_data$adm0_name == "Bassas da India"] = "India"
+price_data$adm0_name[price_data$adm0_name == "Cape Verde"] = "Cabo Verde"
+
+price_data$IFSname <- price_data$adm0_name
+price_data$IFSname[price_data$IFSname == "Democratic Republic of the Congo"] <- "Congo, the Democratic Republic of the"
+price_data$IFSname[price_data$IFSname == "State of Palestine"] <- "Israel"
+price_data$IFSname[price_data$IFSname == "Swaziland"] <- "Eswatini"
+price_data$IFSname[price_data$IFSname == "Venezuela"] <- "Venezuela, Bolivarian Republic"
+
+price_data$date <- as.Date(paste("1", as.character(price_data$mp_month), as.character(price_data$mp_year)), format = "%d %m %Y")
+price_data$date_month <- as.yearmon(price_data$date)
+price_data$year.month <- substr(as.character(price_data$date), start = 1, stop = 7)
+price_data$year <- year(price_data$date)
+  
+price_data <- price_data %>% select(-mp_month, -mp_year)
+
+price_data <- price_data %>% group_by(adm0_name, adm1_name, mkt_name, cm_name) %>% mutate(date_min = min(date), date_max = max(date), year_min = year(date_min), year_max = year(date_max), no_obs = n())
+
+price_data <- price_data %>% group_by(adm0_name, adm1_name, mkt_name, cm_name) %>% mutate(date_min = min(date), date_max = max(date), no_obs = n())
+
+price_data <- price_data %>% group_by(adm0_name) %>% mutate(date_min_c = min(date), date_max_c = max(date)) %>% ungroup()
+
+price_data <- price_data %>% mutate(month_since_first = interval(date_min, date) %/% months(1))
+
+price_data <- price_data %>% arrange(adm0_name, adm1_name, mkt_name, cm_name, month_since_first) %>% group_by(adm0_name, adm1_name, mkt_name, cm_name) %>% mutate(obs_no = row_number())
+
+price_data$month_span <- round((as.yearmon(price_data$date_max) - as.yearmon(price_data$date_min))*12 + 1)
+
+
+price_data <- price_data %>% arrange(adm0_name, adm1_name, mkt_name, cm_name, month_since_first) %>% group_by(adm0_name, adm1_name, mkt_name, cm_name) %>% mutate(diff1 = month_since_first - lag(month_since_first), diff2 = lead(month_since_first) - month_since_first)
+
+
+### Exchange Rates
+price_data <- price_data %>% ungroup()
+countries <- unique(price_data %>% select(adm0_name, date_min_c, date_max_c))
+countries$country_code <- countrycode(countries$adm0_name, origin = "country.name", destination = "iso2c")
+countries$country_code[countries$adm0_name == "State of Palestine"] <- "IL"
+countries$date_min_c <- substr(as.character(countries$date_min_c), start = 1, stop = 7) 
+countries$date_max_c <- substr(as.character(countries$date_max_c), start = 1, stop = 7)
+countries <- countries[countries$country_code != "VE",]
+countries <- countries[countries$country_code != "ZW",]
+
+databaseID <- "IFS"
+
+exchange_rate <- data.table()
+for(i in 1:nrow(countries)) {
+  Sys.sleep(0.5)
+  date_min <- countries$date_min_c[i]  
+  date_max <- countries$date_max_c[i]
+  country <- countries$country_code[i]
+  e_r <- CompactDataMethod(databaseID, list(CL_FREA = "M", CL_AREA_IFS = country, CL_INDICATOR_IFS = c("ENDA_XDC_USD_RATE")), 
+                           startdate = date_min, enddate = date_max, checkquery = FALSE, tidy = TRUE)
+  e_r <- data.table(date = e_r[1], value = e_r[2], country = countries$adm0_name[i])
+  exchange_rate <- rbind(exchange_rate, e_r)
+}
+
+exchange_rate <- as_tibble(exchange_rate) %>% select("year.month" = "date.@TIME_PERIOD", "adm0_name" = "country", "exchange_rate" = "value.@OBS_VALUE")
+
+price_data <- price_data %>% left_join(exchange_rate)
+  
+#price_data2 <- price_data %>% filter(no_obs >= 12)
+price_data$adm0_name[price_data$adm0_name == "Israel"] = "State of Palestine"
+
+price_data$continent <- countrycode(price_data$adm0_name, origin = 'country.name', destination = 'continent')
+
+product_list <- unique(price_data %>% select(adm0_name, adm1_name, mkt_name, cm_name)) %>% arrange(adm0_name, adm1_name, mkt_name, cm_name)
+
+price_data <- price_data %>% ungroup()
+
+
+```
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
+
+```{r}
+### NA data format (for interpolation) - WFP
+
+price_dataNA <- complete(price_data %>% select(adm0_name, adm1_name, mkt_name, cm_name, IFSname, date_max, date_min, date_max_c, date_min_c, no_obs, date, month_span, pt_name, um_name, um_id, cur_name, continent), date, nesting(adm0_name, adm1_name, mkt_name, cm_name, pt_name, um_name, um_id, cur_name, IFSname, date_max, date_min, date_max_c, date_min_c, no_obs, month_span, continent))
+
+price_dataNA <- price_dataNA %>% left_join(price_data) %>% filter(date <= date_max & date >= date_min)
+
+price_dataNA <- price_dataNA %>% arrange(adm0_name, adm1_name, mkt_name, cm_name, date)
+
+price_dataNA$date_month <- as.yearmon(price_dataNA$date)
+price_dataNA$year.month <- substr(as.character(price_dataNA$date), start = 1, stop = 7)
+
+price_dataNA <- price_dataNA %>% mutate(month_since_first = interval(date_min, date) %/% months(1))
+
+price_dataNA <- price_dataNA %>% arrange(adm0_name, adm1_name, mkt_name, cm_name, month_since_first) %>% group_by(adm0_name, adm1_name, mkt_name, cm_name) %>% mutate(obs_no = row_number())
+
+price_dataNA <- price_dataNA %>% ungroup()
+
+price_dataNA <- price_dataNA %>% left_join(exchange_rate)
+price_dataNA <- price_dataNA %>% mutate(exchange_rate = as.numeric(exchange_rate))
+
+
+price_dataNA <- price_dataNA %>% mutate(exch_adj_price = mp_price/exchange_rate)
+price_dataNA <- price_dataNA %>% mutate(log.adj_price = log(exch_adj_price))
+
+
+price_dataNA <- price_dataNA %>% group_by(adm0_name, adm1_name, mkt_name, cm_name) %>% mutate(diff.log.adj_price = log.adj_price - lag(log.adj_price), lag.diff.log.adj_price = lag(diff.log.adj_price), lead.diff.log.adj_price = lead(diff.log.adj_price))
+
+```
+
+```{r}
+price_data_africa <- price_dataNA %>% filter(continent == "Africa" & no_obs >= 12 & as.numeric(as.yearmon(date_min)) <= 2018 & mkt_name != "National Average" & mkt_name != "National Average (excl. capital)" & adm0_name != "Madagascar" & adm0_name != "Cabo Verde" & adm0_name != "Algeria" & adm0_name != "Libya") %>% ungroup()
+
+locations_afr <- unique(price_data_africa %>% select(adm0_name, adm1_name, mkt_name, continent))
+
+locations_afr$locations <- paste(locations_afr$mkt_name, locations_afr$adm1_name, locations_afr$adm0_name, sep = ", ")
+
+library(ggmap)
+library(tidyverse)
+library(tmaptools)
+library(broom)
+library(maptools)
+library(dplyr)
+library(countrycode)
+library(googleway)
+
+google_geocode_N <- readRDS("google_geocodeN.rds")
+
+google_geocode_N <- google_geocode_N %>% filter(type != "country" & adm0_name != "Madagascar" & adm0_name != "Cabo Verde" & adm0_name != "Algeria" & adm0_name != "Libya")
+
+locations_afr1 <- left_join(locations_afr, google_geocode_N %>% select(adm0_name, adm1_name, mkt_name, lon, lat, address_change, type))
+
+locations_afrNA <- (locations_afr1 %>% filter(is.na(lon) | type %in% c("administrative_area_level_1", "administrative_area_level_2", "route"))) %>% select(-"lon", -"lat", -"type")
+
+register_google(key = "AIzaSyBfLGZobGKT_NZ-pMXxEel7lFBiiVup1VU", write = TRUE)
+getOption("ggmap")
+google_geocodeNA <- geocode(locations_afrNA$locations, "more")
+
+locations_afrNA <- bind_cols(locations_afrNA, google_geocodeNA)
+
+### Take care of these tagged locations later
+locations_afrNA$usa_tag <- endsWith(locations_afrNA$address, 'usa')
+locations_afrNA$na_tag <- is.na(locations_afrNA$address)
+locations_afrNA$adm_tag <- locations_afrNA$type %in% c("administrative_area_level_1", "administrative_area_level_2")
+locations_afrNA$route_tag <- locations_afrNA$type == "route"
+
+
+locations_afrNA_match <- locations_afrNA %>% filter(usa_tag == FALSE & na_tag == FALSE & adm_tag == FALSE & route_tag == FALSE)
+
+locations_afrNA_NM <- locations_afrNA %>% filter(usa_tag == TRUE | na_tag == TRUE | adm_tag == TRUE | route_tag == TRUE)
+write.csv(locations_afrNA_NM, "locations_afrNA_NM.csv")
+# Adjame, Yamoussoukro, Cote d'Ivoire --> Yamoussoukro, Cote d'Ivoire
+# Remove rest of NAs
+
+locations_afr_lat_lon <- bind_rows(locations_afr1 %>% filter(!is.na(lon) & type != "administrative_area_level_1" & type != "administrative_area_level_2" & type != "route") %>% select(adm0_name, adm1_name, mkt_name, lon, lat), locations_afrNA_match %>% select(adm0_name, adm1_name, mkt_name, lon, lat))
+
+
+
+
+locations_afrNA_NM <- locations_afrNA_NM %>% mutate(address_change = case_when(
+                                      mkt_name == "Namouno (CBM)" ~ "Namounou Department, Burkina Faso", 
+                                      mkt_name == "Kanyosha" ~ "Kanyosha, Bujumbura Mairie, Burundi",
+                                      mkt_name == "Kinama" ~ "Kinama, Nyamaboko, Burundi",
+                                      mkt_name == "Nyabihanga" ~ "Nyamibanga, Burundi",
+                                      mkt_name == "Bégoua" ~ "Hôtel Golf Palace, Bimbo, Central African Republic",
+                                      mkt_name == "Adjame" ~ "Adjame, Cote d'Ivoire",
+                                      mkt_name == "Amaro" ~ "Amaro District Administration",
+                                      mkt_name == "Conakry-Yéguéma" ~ "Grand Marché de Conakry",
+                                      mkt_name == "Gbarma" ~ "Gbaama, Liberia",
+                                      mkt_name == "Tuobo-Gbaweeleken" ~ "Gbaaka, Liberia",
+                                      mkt_name == "Ntakataka" ~ "Mtakataka, Malawi",
+                                      mkt_name == "Sharpevaley" ~ "Sharpevalle Masjid, Malawi",
+                                      mkt_name == "Euthin" ~ "Euthini, Malawi",
+                                      mkt_name == "Chikweo" ~ "Chikwawa, Malawi",
+                                      mkt_name == "Nkhate" ~ "XR42+FM Chikwawa, Malawi",
+                                      mkt_name == "Chikweo" ~ "Chikwawa, Malawi",
+                                      mkt_name == "Thekelani" ~ "Thekerani, Malawi",
+                                      mkt_name == "Lexeiba1" ~ "Marché de Lexeïba Gorgol, Mauritania",
+                                      mkt_name == "Vassala" ~ "Fassala, Mauritania",
+                                      mkt_name == "Abba Gamaram" ~ "Abbaganaram Market I",
+                                      mkt_name == "Baga Road" ~ "Baga road market, Nigeria",
+                                      mkt_name == "Bursari" ~ "Baiomari, Nigeria",
+                                      mkt_name == "Yunusari" ~ "Kanama, Nigeria",
+                                      mkt_name == "Bubare" ~ "Nyabiheke Health Centre, Rwanda",
+                                      mkt_name == "Mugera" ~ "Mugera Market, Rwanda",
+                                      mkt_name == "Ntunga" ~ "Ntunga Market, Gikoro, Rwanda",
+                                      mkt_name == "Ntungaruze" ~ "Mugera Market, Rwanda",
+                                      mkt_name == "Ndago" ~ "Ndago Market, Rwanda",
+                                      mkt_name == "Bumazi" ~ "Giheke Catholic Church, Rwanda",
+                                      mkt_name == "Karongi" ~ "Karongi Refugee Camp, Rwanda",
+                                      mkt_name == "Mubuga" ~ "Mubuga Sector Office, Rwanda",
+                                      mkt_name == "Nyagahanika" ~ "Nyagahinika market, Rwanda",
+                                      mkt_name == "Gatunda" ~ "Gatunda Sector Office, Rwanda",
+                                      mkt_name == "Buale" ~ "Dujuma, Somalia",
+                                      mkt_name == "Marka (Shabelle Hoose)" ~ "Merca, Somalia",
+                                      mkt_name == "Hhohho" ~ "Mbabane, Swaziland",
+                                      mkt_name == "Lubombo" ~ "Siteki, Swaziland",
+                                      mkt_name == "Shiselweni" ~ "Nhlangano, Swaziland",
+                                      mkt_name == "Dodoma Region" ~ "Dodoma City, Tanzania",
+                                      mkt_name == "Kagera Region" ~ "	Bukoba, Tanzania",
+                                      mkt_name == "Katavi Region" ~ "Mpanda, Tanzania",
+                                      mkt_name == "Manyara Region" ~ "Nhlangano, Tanzania",
+                                      mkt_name == "Mara Region" ~ "Babati, Tanzania",
+                                      mkt_name == "Njombe Region" ~ "Njombe, Tanzania",
+                                      mkt_name == "Pwani Region" ~ "Kibaha, Tanzania",
+                                      mkt_name == "Rukwa Region" ~ "Sumbawanga, Tanzania",
+                                      mkt_name == "Ruvuma Region" ~ "Songea, Tanzania",
+                                      mkt_name == "Simiyu Region" ~ "	Bariadi, Tanzania",
+                                      mkt_name == "Lufwanyama" ~ "Lufwanyama District Hospital, Zambia",
+                                      mkt_name == "Rushinga Growth Point" ~ "Rushinga Education District Office, Zimbabwe",
+                                      mkt_name == "Sarahuro" ~ "Sarahuru Shopping Centre, Neshuro, Zimbabwe",
+                                      mkt_name == "Siakobvu" ~ "Chief Nebiris Village, Zimbabwe",
+                                      mkt_name == "Kombai" ~ "GX95+25P, Shurugwi, Zimbabwe",
+                                      TRUE ~ ""))
+
+
+geocode_afrNA_NM <- geocode(locations_afrNA_NM$address_change, "more")
+
+locations_afrNA_NM <- bind_cols(locations_afrNA_NM %>% select(-lon, -lat), geocode_afrNA_NM %>% select(lon, lat))
+
+locations_afr_lat_lon <-locations_afr_lat_lon %>% bind_rows(locations_afrNA_NM %>% select(adm0_name, adm1_name, mkt_name, lon, lat) %>% filter(!is.na(lon)))
+
+price_data_africa <- left_join(price_data_africa, locations_afr_lat_lon)
+```
+
+```{r}
+library(sf)
+locations_afr_lat_lon_sf <- st_as_sf(locations_afr_lat_lon, coords = c("lon", "lat"),  crs = 4326)
+
+Africa_refugee_camps <- read.csv("African_Refugee_Data.csv")
+
+Africa_refugee_camps_sf <- st_as_sf(Africa_refugee_camps, coords = c("Longitude", "Latitude"),  crs = 4326)
+
+library(nngeo)
+nearest_unknown_op <- st_join(Africa_refugee_camps_sf, Africa_refugee_camps_sf %>% filter(Unknown_Op == 0), st_nn, k = 1) %>% filter(Unknown_Op.x == 1) %>% select(Country = Country.x, Location = Location.x, Open_Date.y)
+
+st_geometry(nearest_unknown_op) <- NULL
+
+Africa_refugee_camps <- Africa_refugee_camps %>% left_join(nearest_unknown_op)
+
+Africa_refugee_camps <- Africa_refugee_camps %>% mutate(Open_Date = case_when(
+                                      Open_Date == 1111 ~ Open_Date.y,
+                                      TRUE ~ Open_Date)) %>% select(-Open_Date.y) %>% mutate(Closing.Da = as.numeric(as.character(Closing.Da)))
+
+Africa_refugee_camps <- Africa_refugee_camps %>% mutate(Closing.Da = case_when(
+                                      is.na(Closing.Da) ~ as.numeric(year(Sys.Date())),
+                                      TRUE ~ Closing.Da))
+
+Africa_refugee_camps_sf <- st_as_sf(Africa_refugee_camps, coords = c("Longitude", "Latitude"),  crs = 4326)
+
+library(raster)
+all_distances <- pointDistance(locations_afr_lat_lon_sf, Africa_refugee_camps_sf, lonlat = TRUE)
+
+detach("package:raster", unload = TRUE)
+all_distances_v <- as.vector(t(all_distances))
+
+price_refugee_cross <- tibble(locations_afr_lat_lon %>% 
+                 expand_grid(as_tibble(Africa_refugee_camps))) %>% mutate(dist_km = all_distances_v/ 1000)
+
+price_refugee_cross_400 <- price_refugee_cross %>% filter(dist_km <= 400) %>% arrange(adm0_name, adm1_name, mkt_name, dist_km) %>% group_by(adm0_name, adm1_name, mkt_name) %>% mutate(dist_rank = row_number())
+
+# Create Distance Bound Function
+
+refugee_camp_bound <- function(lower, upper, by_gap) {
+for(i in seq(lower, upper, by = by_gap)) {
+  distance_bound_camps <- price_refugee_cross_400 %>%
+    filter(dist_km > i-by_gap & dist_km <= i) %>%
+    group_by(adm0_name, adm1_name, mkt_name) %>%
+    summarise(N_camps = n(), open_date = min(Open_Date), close_date = max(Closing.Da)) %>%
+                ungroup() %>% 
+                right_join(price_refugee_cross_400 %>% group_by(adm0_name, adm1_name, mkt_name) %>% summarise() %>% ungroup())
+  names(distance_bound_camps) <-  c("adm0_name", "adm1_name", "mkt_name", paste0("N_refugee_camps_", as.character(i-by_gap), "_", as.character(i)),
+                     paste0("Open_Date_", as.character(i-by_gap), "_", as.character(i)),
+                     paste0("Close_Date_", as.character(i-by_gap), "_", as.character(i)))
+  price_refugee_cross_all <- price_refugee_cross_all %>% left_join(distance_bound_camps)
+  }
+  return(price_refugee_cross_all)
+}
+
+
+price_refugee_cross_all <- price_refugee_cross_400 %>% select("adm0_name", "adm1_name", "mkt_name")
+
+
+price_refugee_cross_all <- refugee_camp_bound(5, 100, 5)
+price_refugee_cross_all <- refugee_camp_bound(20, 200, 20)
+price_refugee_cross_all <- refugee_camp_bound(50, 200, 50)
+
+# Create Greater than/Smaller than distance bound function
+
+refugee_camp_bound_G_L <- function(...){
+  for(i in c(...)) {
+    distance_bound_camps <- price_refugee_cross_400 %>%
+      filter(dist_km <= i) %>%
+      group_by(adm0_name, adm1_name, mkt_name) %>%
+      summarise(N_camps = n(), open_date = min(Open_Date), close_date = max(Closing.Da)) %>%
+                  ungroup() %>% 
+                  right_join(price_refugee_cross_400 %>% group_by(adm0_name, adm1_name, mkt_name) %>% summarise() %>%       ungroup())
+     names(distance_bound_camps) <-  c("adm0_name", "adm1_name", "mkt_name", paste0("N_refugee_camps_", "L", "_", as.character(i)),
+                     paste0("Open_Date_", "L", "_", as.character(i)),
+                     paste0("Close_Date_", "L", "_", as.character(i)))
+    price_refugee_cross_all <- price_refugee_cross_all %>% left_join(distance_bound_camps)
+    
+    distance_bound_camps <- price_refugee_cross_400 %>%
+      filter(dist_km <= i) %>%
+      group_by(adm0_name, adm1_name, mkt_name) %>%
+      summarise(N_camps = n(), open_date = min(Open_Date), close_date = max(Closing.Da)) %>%
+                  ungroup() %>% 
+                  right_join(price_refugee_cross_400 %>% group_by(adm0_name, adm1_name, mkt_name) %>% summarise() %>% ungroup())
+      names(distance_bound_camps) <-  c("adm0_name", "adm1_name", "mkt_name", paste0("N_refugee_camps_", "G", "_", as.character(i)),
+                     paste0("Open_Date_", "G", "_", as.character(i)),
+                     paste0("Close_Date_", "G", "_", as.character(i)))
+      price_refugee_cross_all <- price_refugee_cross_all %>% left_join(distance_bound_camps)
+}
+  return(price_refugee_cross_all)
+}
+
+
+price_refugee_cross_all <- refugee_camp_bound_G_L(10,15,20)
+
+
+```
+
+
+
+```{r}
+unique_cm <- unique(price_data_africa %>% select(cm_name))
+
+unique_cm <- unique_cm %>% mutate(food_item = case_when(
+                                      startsWith(unique_cm$cm_name, 'Milk') == TRUE ~ "Milk", 
+                                      startsWith(unique_cm$cm_name, 'Oil') == TRUE ~ "Cooking.Oil",
+                                      startsWith(unique_cm$cm_name, 'Rice') == TRUE ~ "Rice",
+                                      startsWith(unique_cm$cm_name, 'Fish') == TRUE ~ "Seafood",
+                                      startsWith(unique_cm$cm_name, 'Fuel') == TRUE |
+                                      startsWith(unique_cm$cm_name, 'Charcoal') ~ "Fuel",
+                                      startsWith(unique_cm$cm_name, 'Cocoyam') == TRUE |  
+                                      startsWith(unique_cm$cm_name, 'Taro') == TRUE |
+                                      startsWith(unique_cm$cm_name, 'Cassava') == TRUE |
+                                      startsWith(unique_cm$cm_name, 'Gari') == TRUE  |
+                                      startsWith(unique_cm$cm_name, 'Yam') == TRUE ~ "Cassava/Yam",
+                                      startsWith(unique_cm$cm_name, 'Meat')  == TRUE |  
+                                      startsWith(unique_cm$cm_name, 'Chicken') == TRUE |  
+                                      startsWith(unique_cm$cm_name, 'Eggs') == TRUE ~ "Meat/Eggs",
+                                      startsWith(unique_cm$cm_name, 'Livestock') == TRUE ~ "Livestock",
+                                      startsWith(unique_cm$cm_name, 'Barley') == TRUE ~ "Barley",
+                                      startsWith(unique_cm$cm_name, 'Maize') == TRUE ~ "Maize",
+                                      startsWith(unique_cm$cm_name, 'Sorghum') == TRUE ~ "Sorghum",
+                                      startsWith(unique_cm$cm_name, 'Wheat') == TRUE |
+                                      startsWith(unique_cm$cm_name, 'Couscous') == TRUE  ~ "Wheat",
+                                      startsWith(unique_cm$cm_name, 'Potatoes') == TRUE |
+                                      startsWith(unique_cm$cm_name, 'Sweet potatoes') == TRUE  ~ "Potatoes",
+                                      startsWith(unique_cm$cm_name, 'Groundnuts')  == TRUE |
+                                      startsWith(unique_cm$cm_name, 'Peanut') == TRUE ~ "Peanuts",
+                                      startsWith(unique_cm$cm_name, 'Coffee') == TRUE ~ "Coffee",
+                                      startsWith(unique_cm$cm_name, 'Tea') == TRUE ~ "Tea",
+                                      startsWith(unique_cm$cm_name, 'Cocoa') == TRUE ~ "Cocoa",
+                                      startsWith(unique_cm$cm_name, 'Sugar') == TRUE ~ "Sugar",
+                                      startsWith(unique_cm$cm_name, 'Beans') == TRUE | 
+                                      startsWith(unique_cm$cm_name, 'Peas') == TRUE | 
+                                      startsWith(unique_cm$cm_name, 'Chickpeas') == TRUE | 
+                                      startsWith(unique_cm$cm_name, 'Lentils') == TRUE | 
+                                      startsWith(unique_cm$cm_name, 'Soybeans') == TRUE | 
+                                      startsWith(unique_cm$cm_name, 'Cowpeas') == TRUE | 
+                                      startsWith(unique_cm$cm_name, 'Cashew') == TRUE |
+                                      startsWith(unique_cm$cm_name, 'Pigeon peas') == TRUE ~ "Beans/Pulses/Lentils",
+                                      startsWith(unique_cm$cm_name, 'Carrots') == TRUE |
+                                      startsWith(unique_cm$cm_name, 'Garlic') == TRUE |
+                                      startsWith(unique_cm$cm_name, 'Lettuce') == TRUE | 
+                                      startsWith(unique_cm$cm_name, 'Zucchini') == TRUE | 
+                                      startsWith(unique_cm$cm_name, 'Cauliflower') == TRUE | 
+                                      startsWith(unique_cm$cm_name, 'Tomatoes') == TRUE | 
+                                      startsWith(unique_cm$cm_name, 'Spinach') == TRUE | 
+                                      startsWith(unique_cm$cm_name, 'Onions') == TRUE | 
+                                      startsWith(unique_cm$cm_name, 'Peppers') == TRUE | 
+                                      startsWith(unique_cm$cm_name, 'Cucumbers') == TRUE | 
+                                      startsWith(unique_cm$cm_name, 'Chili') == TRUE | 
+                                      startsWith(unique_cm$cm_name, 'Cabbage') == TRUE | 
+                                      startsWith(unique_cm$cm_name, 'Eggplants') == TRUE ~ "Vegetables",
+                                      startsWith(unique_cm$cm_name, 'Oranges') == TRUE |
+                                      startsWith(unique_cm$cm_name, 'Guava') == TRUE  |
+                                      startsWith(unique_cm$cm_name, 'Watermelons') == TRUE |
+                                      startsWith(unique_cm$cm_name, 'Mangoes') == TRUE |
+                                      startsWith(unique_cm$cm_name, 'Apples') == TRUE |
+                                      startsWith(unique_cm$cm_name, 'Papaya') == TRUE |
+                                      startsWith(unique_cm$cm_name, 'Passion') == TRUE |
+                                      startsWith(unique_cm$cm_name, 'Bananas') == TRUE |
+                                      startsWith(unique_cm$cm_name, 'Avocados') == TRUE |
+                                      startsWith(unique_cm$cm_name, 'Plantains') == TRUE ~ "Fruit",
+                                      startsWith(unique_cm$cm_name, 'Bread') == TRUE |
+                                      startsWith(unique_cm$cm_name, 'Pasta') == TRUE ~ "Bread/Pasta",
+                                      startsWith(unique_cm$cm_name, 'Sesame') == TRUE ~ "Sesame",
+                                      startsWith(unique_cm$cm_name, 'Millet') == TRUE |
+                                      startsWith(unique_cm$cm_name, 'Fonio') == TRUE ~ "Millet",
+                                      startsWith(unique_cm$cm_name, 'Cornstarch') == TRUE ~ "Cornstarch",
+                                      startsWith(unique_cm$cm_name, 'Salt') == TRUE ~ "Salt",
+                                      TRUE ~ ""))
+
+unique_cm_loc <- unique(price_data_africa %>% select(adm0_name, adm1_name, mkt_name, cm_name))
+
+price_data_africaF <- price_data_africa %>% left_join(unique_cm) %>% filter(food_item != "")
+price_data_africaF$year <- year(price_data_africaF$date)
+
+food_refugee_Afr <- price_data_africaF %>% filter(food_item != "Fuel") %>% left_join(price_refugee_cross_all, by = c("adm0_name", "adm1_name", "mkt_name"))
+
+var_pos1 = ncol(price_data_africaF) + 1
+var_pos2 = ncol(food_refugee_Afr)
+
+
+for(i in seq(var_pos1, var_pos2, by = 3)) {
+  food_refugee_Afr  <- food_refugee_Afr  %>% mutate(refugee_camp_year = case_when(year >= food_refugee_Afr[,i+1] & year <= food_refugee_Afr[,i+2] & !is.na(food_refugee_Afr[,i]) ~ 1, TRUE ~ 0))
+  
+names(food_refugee_Afr)[names(food_refugee_Afr) == 'refugee_camp_year'] <- paste('refugee_camp_year', sub("Open_Date_*", "", names(food_refugee_Afr[i + 1])), sep = "_")
+}
+
+
+food_refugee_Afr <- food_refugee_Afr %>% mutate(food_cereal = case_when(
+                                      food_item %in% c("Rice", "Wheat", "Sorghum", "Maize", "Beans/Pulses/Lentils") ~ 1, 
+                                      TRUE ~ 0))
+
+quantile1.99 <- quantile(food_refugee_Afr$diff.log.adj_price,  probs = c(0.01, 0.99), na.rm = TRUE)
+
+food_refugee_Afr_f <- food_refugee_Afr %>% filter(diff.log.adj_price > quantile1.99[1] & diff.log.adj_price < quantile1.99[2])
+
+food_refugee_Afr_f <- food_refugee_Afr_f %>% rename("diff_log_adj_price" = "diff.log.adj_price")
+
+saveRDS(food_refugee_Afr_f, "C:/Users/hasee/Dropbox/Food Price - Refugee Camps/Data Final/food_refugee_Afr_f")
+
+#save.image("C:/Users/hasee/OneDrive/Documents/refugee_prices.RData")
+
+```
+
+
+```{r}
+library(lfe)
+library(broom)
+memory.limit(20000000000)
+
+#load("C:/Users/hasee/OneDrive/Documents/refugee_prices.RData")
+food_refugee_Afr_f <- readRDS("C:/Users/hasee/Dropbox/Food Price - Refugee Camps/Data Final/food_refugee_Afr_f")
+
+
+cereals_refugee_Afr <- food_refugee_Afr_f %>% filter(food_cereal == 1)
+non_cereals_refugee_Afr <- food_refugee_Afr_f %>% filter(food_cereal == 0)
+
+reg_price_refugee_0_100 <- felm(diff_log_adj_price ~ refugee_camp_year_0_5 + refugee_camp_year_5_10 + refugee_camp_year_10_15 + refugee_camp_year_15_20 + refugee_camp_year_20_25 + refugee_camp_year_25_30 +   
+refugee_camp_year_30_35 + refugee_camp_year_35_40 + refugee_camp_year_40_45 + refugee_camp_year_45_50 + refugee_camp_year_50_55 + refugee_camp_year_55_60 + refugee_camp_year_60_65 + refugee_camp_year_65_70 +   
+refugee_camp_year_70_75 + refugee_camp_year_75_80 + refugee_camp_year_80_85 + refugee_camp_year_85_90 +   
+refugee_camp_year_90_95 + refugee_camp_year_95_100 | mkt_name + food_item + as.factor(date) | 0 | mkt_name, data = food_refugee_Afr_f)
+
+tidy_all <- tidy(reg_price_refugee_0_100)
+tidy_all$term <- as.factor(paste0("Dist. to Refugee Camp >", as.character(seq(0, 95, by = 5)), " & <", as.character(seq(5, 100, by = 5))))
+
+saveRDS(reg_price_refugee.0_100, "~/Data Final/reg_price_refugee.0_100")
+
+reg_cereal_0_100 <- felm(diff_log_adj_price ~ refugee_camp_year_0_5 + refugee_camp_year_5_10 + refugee_camp_year_10_15 + refugee_camp_year_15_20 + refugee_camp_year_20_25 + refugee_camp_year_25_30 +   
+refugee_camp_year_30_35 + refugee_camp_year_35_40 + refugee_camp_year_40_45 + refugee_camp_year_45_50 + refugee_camp_year_50_55 + refugee_camp_year_55_60 + refugee_camp_year_60_65 + refugee_camp_year_65_70 +   
+refugee_camp_year_70_75 + refugee_camp_year_75_80 + refugee_camp_year_80_85 + refugee_camp_year_85_90 +   
+refugee_camp_year_90_95 + refugee_camp_year_95_100 | mkt_name + food_item + as.factor(date) | 0 | mkt_name, data = cereals_refugee_Afr)
+
+tidy_cereals <- tidy(reg_cereal_0_100)
+tidy_cereals$term <- as.factor(paste0("Dist. to Refugee Camp >", as.character(seq(0, 95, by = 5)), " & <", as.character(seq(5, 100, by = 5))))
+
+saveRDS(reg_cereal_0_100, "~/Data Final/reg_cereal.0_100")
+
+reg_non_cereal_0_100 <- felm(diff_log_adj_price ~ refugee_camp_year_0_5 + refugee_camp_year_5_10 + refugee_camp_year_10_15 + refugee_camp_year_15_20 + refugee_camp_year_20_25 + refugee_camp_year_25_30 +   
+refugee_camp_year_30_35 + refugee_camp_year_35_40 + refugee_camp_year_40_45 + refugee_camp_year_45_50 + refugee_camp_year_50_55 + refugee_camp_year_55_60 + refugee_camp_year_60_65 + refugee_camp_year_65_70 +   
+refugee_camp_year_70_75 + refugee_camp_year_75_80 + refugee_camp_year_80_85 + refugee_camp_year_85_90 +   
+refugee_camp_year_90_95 + refugee_camp_year_95_100 | mkt_name + food_item + as.factor(date) | 0 | mkt_name, data = non_cereals_refugee_Afr)
+
+tidy_non_cereals <- tidy(reg_non_cereal_0_100)
+tidy_non_cereals$term <- as.factor(paste0("Dist. to Refugee Camp >", as.character(seq(0, 95, by = 5)), " & <", as.character(seq(5, 100, by = 5))))
+
+
+saveRDS(reg_non_cereal.0_100, "C:/Users/hasee/Dropbox/Food Price - Refugee Camps/Data Final/reg_non_cereal.0_100")
+
+```
+
+
+```{r}
+library(lfe)
+library(broom)
+memory.limit(20000000000)
+
+#load("C:/Users/hasee/OneDrive/Documents/refugee_prices.RData")
+#food_refugee_Afr_f <- readRDS("C:/Users/hasee/Dropbox/Food Price - Refugee Camps/Data Final/food_refugee_Afr_f")
+
+reg_lprice_refugee_0_100 <- felm(log.adj_price ~ refugee_camp_year_0_5 + refugee_camp_year_5_10 + refugee_camp_year_10_15 + refugee_camp_year_15_20 + refugee_camp_year_20_25 + refugee_camp_year_25_30 +   
+refugee_camp_year_30_35 + refugee_camp_year_35_40 + refugee_camp_year_40_45 + refugee_camp_year_45_50 + refugee_camp_year_50_55 + refugee_camp_year_55_60 + refugee_camp_year_60_65 + refugee_camp_year_65_70 +   
+refugee_camp_year_70_75 + refugee_camp_year_75_80 + refugee_camp_year_80_85 + refugee_camp_year_85_90 +   
+refugee_camp_year_90_95 + refugee_camp_year_95_100 | mkt_name + food_item + as.factor(date) | 0 | mkt_name, data = food_refugee_Afr_f)
+
+tidy_all <- tidy(reg_lprice_refugee_0_100)
+tidy_all$term <- as.factor(paste0("Dist. to Refugee Camp >", as.character(seq(0, 95, by = 5)), " & <", as.character(seq(5, 100, by = 5))))
+
+tidy_all$term <- fct_inorder(tidy_all$term, ordered = NA)
+
+#saveRDS(reg_price_refugee.0_100, "C:/Users/hasee/Dropbox/Food Price - Refugee Camps/Data Final/reg_price_refugee.0_100")
+
+reg_lcereal_0_100 <- felm(log.adj_price  ~ refugee_camp_year_0_5 + refugee_camp_year_5_10 + refugee_camp_year_10_15 + refugee_camp_year_15_20 + refugee_camp_year_20_25 + refugee_camp_year_25_30 +   
+refugee_camp_year_30_35 + refugee_camp_year_35_40 + refugee_camp_year_40_45 + refugee_camp_year_45_50 + refugee_camp_year_50_55 + refugee_camp_year_55_60 + refugee_camp_year_60_65 + refugee_camp_year_65_70 +   
+refugee_camp_year_70_75 + refugee_camp_year_75_80 + refugee_camp_year_80_85 + refugee_camp_year_85_90 +   
+refugee_camp_year_90_95 + refugee_camp_year_95_100 | mkt_name + food_item + as.factor(date) | 0 | mkt_name, data = cereals_refugee_Afr)
+
+tidy_cereals <- tidy(reg_lcereal_0_100)
+tidy_cereals$term <- as.factor(paste0("Dist. to Refugee Camp >", as.character(seq(0, 95, by = 5)), " & <", as.character(seq(5, 100, by = 5))))
+
+tidy_cereals$term <- fct_inorder(tidy_cereals$term, ordered = NA)
+
+
+#saveRDS(reg_cereal.0_100, "C:/Users/hasee/Dropbox/Food Price - Refugee Camps/Data Final/reg_cereal.0_100")
+
+reg_lnon_cereal_0_100 <- felm(log.adj_price ~ refugee_camp_year_0_5 + refugee_camp_year_5_10 + refugee_camp_year_10_15 + refugee_camp_year_15_20 + refugee_camp_year_20_25 + refugee_camp_year_25_30 +   
+refugee_camp_year_30_35 + refugee_camp_year_35_40 + refugee_camp_year_40_45 + refugee_camp_year_45_50 + refugee_camp_year_50_55 + refugee_camp_year_55_60 + refugee_camp_year_60_65 + refugee_camp_year_65_70 +   
+refugee_camp_year_70_75 + refugee_camp_year_75_80 + refugee_camp_year_80_85 + refugee_camp_year_85_90 +   
+refugee_camp_year_90_95 + refugee_camp_year_95_100 | mkt_name + food_item + as.factor(date) | 0 | mkt_name, data = non_cereals_refugee_Afr)
+
+tidy_non_cereals <- tidy(reg_lnon_cereal_0_100)
+tidy_non_cereals$term <- as.factor(paste0("Dist. to Refugee Camp >", as.character(seq(0, 95, by = 5)), " & <", as.character(seq(5, 100, by = 5))))
+
+levels(tidy_non_cereals$term) <- fct_relevel(tidy_non_cereals$term, "Dist. to Refugee Camp >5 & <10", after = 1)
+
+#saveRDS(reg_non_cereal.0_100, "C:/Users/hasee/Dropbox/Food Price - Refugee Camps/Data Final/reg_non_cereal.0_100")
+
+```
+
+```{r}
+library(stargazer)
+
+stargazer(reg_price_refugee_0_100, reg_cereal_0_100, reg_non_cereal_0_100, title="Results",  single.row = TRUE, dep.var.labels="First Difference of Logged Prices", column.labels = c("All Foods", "Staple Foods", "Non-Staple Foods"),
+covariate.labels=paste0("Dist to Refugee Camp ", as.character(seq(0, 95, by = 5)), " to ", as.character(seq(5, 100, by = 5))))
+
+
+```
+
+```{r}
+fit <- reg_lprice_refugee_0_100
+#x_labels <- paste0(as.character(seq(0, 95, by = 5)), " to ", as.character(seq(5, 100, by = 5)))
+
+#tidy_all$term <- x_labels
+
+fit_all_95 <- confint(fit, level = 0.95) %>% 
+  data.frame() %>%
+  rename("conf.low_95" = "X2.5..",
+         "conf.high_95" = "X97.5..")
+fit_all_90 <- confint(fit, level = 0.90) %>% 
+  data.frame() %>%
+  rename("conf.low_90" = "X5..",
+         "conf.high_90" = "X95..")
+results <- bind_cols(tidy_all, 
+                     fit_all_95, 
+                     fit_all_90) %>%
+           rename(Variable = term,
+                  Coefficient = estimate,
+                  SE = std.error) %>%
+           filter(Variable != "(Intercept)")
+
+results$Variable <- fct_inorder(results$Variable, ordered = TRUE)
+
+ggplot(results, aes(x = Variable, y = Coefficient)) +
+        geom_hline(yintercept = 0, colour = gray(1/2), lty = 2) +
+        geom_point(aes(x = Variable, 
+                    y = Coefficient)) + 
+        geom_linerange(aes(x = Variable, 
+                     ymin = conf.low_90,
+                     ymax = conf.high_90),
+                   lwd = 1) +
+        geom_linerange(aes(x = Variable, 
+                     ymin = conf.low_95,
+                     ymax = conf.high_95),
+                   lwd = 1/2) + 
+        ggtitle("All Foods: Regressing Distance of Refugee Camp opening on price change") +
+        theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+        xlab("Distance to Refugee Camp Opening") 
+
+
+  
+
+```
+
+```{r}
+fit <- reg_lcereal_0_100
+
+fit_all_95 <- confint(fit, level = 0.95) %>% 
+  data.frame() %>%
+  rename("conf.low_95" = "X2.5..",
+         "conf.high_95" = "X97.5..")
+fit_all_90 <- confint(fit, level = 0.90) %>% 
+  data.frame() %>%
+  rename("conf.low_90" = "X5..",
+         "conf.high_90" = "X95..")
+results <- bind_cols(tidy_cereals, 
+                     fit_all_95, 
+                     fit_all_90) %>%
+           rename(Variable = term,
+                  Coefficient = estimate,
+                  SE = std.error) %>%
+           filter(Variable != "(Intercept)")
+
+results$Variable <- fct_inorder(results$Variable, ordered = TRUE)
+
+ggplot(results, aes(x = Variable, y = Coefficient)) +
+        geom_hline(yintercept = 0, colour = gray(1/2), lty = 2) +
+        geom_point(aes(x = Variable, 
+                    y = Coefficient)) + 
+        geom_linerange(aes(x = Variable, 
+                     ymin = conf.low_90,
+                     ymax = conf.high_90),
+                   lwd = 1) +
+        geom_linerange(aes(x = Variable, 
+                     ymin = conf.low_95,
+                     ymax = conf.high_95),
+                   lwd = 1/2) + 
+        ggtitle("Only Staples: Regressing Distance of Refugee Camp opening on price change") +
+        theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+        xlab("Distance to Refugee Camp Opening") 
+
+
+  
+
+```
+```{r}
+fit <- reg_lnon_cereal_0_100
+
+fit_all_95 <- confint(fit, level = 0.95) %>% 
+  data.frame() %>%
+  rename("conf.low_95" = "X2.5..",
+         "conf.high_95" = "X97.5..")
+fit_all_90 <- confint(fit, level = 0.90) %>% 
+  data.frame() %>%
+  rename("conf.low_90" = "X5..",
+         "conf.high_90" = "X95..")
+results <- bind_cols(tidy_non_cereals, 
+                     fit_all_95, 
+                     fit_all_90) %>%
+           rename(Variable = term,
+                  Coefficient = estimate,
+                  SE = std.error) %>%
+           filter(Variable != "(Intercept)")
+
+results$Variable <- fct_inorder(results$Variable, ordered = TRUE)
+
+ggplot(results, aes(x = Variable, y = Coefficient)) +
+        geom_hline(yintercept = 0, colour = gray(1/2), lty = 2) +
+        geom_point(aes(x = Variable, 
+                    y = Coefficient)) + 
+        geom_linerange(aes(x = Variable, 
+                     ymin = conf.low_90,
+                     ymax = conf.high_90),
+                   lwd = 1) +
+        geom_linerange(aes(x = Variable, 
+                     ymin = conf.low_95,
+                     ymax = conf.high_95),
+                   lwd = 1/2) + 
+        ggtitle("Non-Staples: Regressing Distance of Refugee Camp opening on price change") +
+        theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+        xlab("Distance to Refugee Camp Opening") 
+
+
+  
+
+```
+
